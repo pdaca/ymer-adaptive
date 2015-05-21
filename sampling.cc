@@ -47,6 +47,12 @@
 
 namespace {
 
+  // How much the probability of identifing a false candidate should decrease with every new candidate.
+  // Higher value better for paths with fewer false candidates.
+  const float cnd_ratio_ = 0.5;
+  // The number of states before we inspect a candidate.
+  const int check_cnd_ = 100;
+
 template <typename Algorithm>
 struct ResultType {
 };
@@ -69,6 +75,82 @@ void PrintProgress(int n) {
   }
 }
 
+class StateLess {
+ public:
+  bool operator()(const State& lhs, const State& rhs) const {
+    return lhs.values() < rhs.values();
+  }
+};
+
+
+
+class Candidate  {
+public:
+  Candidate(unsigned int index, const State& init);
+  virtual ~Candidate();
+  inline void count(const State& st);
+  inline bool isTrivial();
+  inline bool contains(const State& st);
+  inline bool isStrong(unsigned int k);
+  inline void mergeWith(const Candidate& other);
+  inline int creationIndex();
+  inline const std::map<State, unsigned int, StateLess>& counter();
+
+private:
+  // Path index when the candidate was created.
+  const int creation_idx_;
+  bool trivial_;
+  // Counts the number of transitions taken from states in the candidate
+  std::map<State, unsigned int, StateLess> counter_;  
+};
+
+ 
+  Candidate::Candidate(unsigned int index, const State& init) :
+    creation_idx_(index),
+    trivial_(true)
+  {
+    counter_[init] = 0;
+  }
+    
+  Candidate::~Candidate() {}
+
+  inline void Candidate::count(const State& st){
+    counter_[st]++;
+    trivial_ = false;
+  }
+
+  inline bool Candidate::isTrivial(){
+    return trivial_;
+  }
+
+  inline bool Candidate::contains(const State& st){
+    return counter_.count(st) > 0;
+  }
+
+  inline bool Candidate::isStrong(unsigned int k){
+    // TODO(przemek) probably this can be improved
+    for (auto it= counter_.begin(); it!=counter_.end(); ++it){
+      if (it->second < k)
+	return false;
+    }
+      return true;
+  }
+
+  inline void Candidate::mergeWith(const Candidate& other){
+    for(auto it=other.counter_.begin(); it != other.counter_.end(); it++) {
+      counter_[it->first] = 0;
+    }
+  }
+
+  inline int Candidate::creationIndex(){
+    return creation_idx_;
+  }
+
+  const std::map<State, unsigned int, StateLess>& Candidate::counter(){
+    return counter_;
+  }
+
+  
 class SamplingVerifier : public CompiledPropertyVisitor,
                          public CompiledPathPropertyVisitor {
  public:
@@ -130,6 +212,11 @@ class SamplingVerifier : public CompiledPropertyVisitor,
       sample_cache_;
   std::unordered_map<int, DdCacheEntry> dd_cache_;
 
+  // Initial visit number, i.e. the number of times a scc is visited before it's pronounced as a bscc
+  float base_vn_;
+  // Increase in visit number after a new non-trivial candidate is found
+  float incr_vn_;
+
   // Registered clients.
   std::map<int, short> registered_clients_;
   // Next client id.
@@ -150,7 +237,15 @@ SamplingVerifier::SamplingVerifier(
       state_(state),
       probabilistic_level_(probabilistic_level),
       stats_(stats),
-      next_client_id_(1) {}
+      next_client_id_(1)
+{
+  if (params_.engine == ModelCheckingEngine::ADAPTIVE){
+    base_vn_ = 1 + log((1-cnd_ratio_) * params_.false_cnd_probability) / log(1-params_.min_transition_probability);
+    incr_vn_ = log(cnd_ratio_)/log(1-params_.min_transition_probability);
+  }
+
+
+}
 
 void SamplingVerifier::DoVisitCompiledNaryProperty(
     const CompiledNaryProperty& property) {
@@ -229,7 +324,7 @@ void SamplingVerifier::DoVisitCompiledNotProperty(
 
 void SamplingVerifier::DoVisitCompiledProbabilityThresholdProperty(
     const CompiledProbabilityThresholdProperty& property) {
-  if (dd_model_ == nullptr && property.path_property().is_unbounded()) {
+  if (params_.engine == ModelCheckingEngine::SAMPLING && property.path_property().is_unbounded()) {
     VerifyProbabilisticProperty(params_.estimation_algorithm,
                                 property.threshold(), property.path_property());
   } else {
@@ -273,7 +368,9 @@ SamplingVerifier::VerifyProbabilisticProperty(
     }
   }
   const double theta0 =
-      std::min(1.0, (theta + params_.delta) * (1.0 - nested_error));
+    (params_.engine == ModelCheckingEngine::ADAPTIVE) ?
+    std::min(1.0, (theta + params_.delta - params_.false_cnd_probability) * (1.0 - nested_error))
+    : std::min(1.0, (theta + params_.delta) * (1.0 - nested_error));
   const double theta1 = std::max(
       0.0, 1.0 - (1.0 - (theta - params_.delta)) * (1.0 - nested_error));
   ModelCheckingParams nested_params = params_;
@@ -531,24 +628,31 @@ void SamplingVerifier::DoVisitCompiledExpressionProperty(
       evaluator_->EvaluateIntExpression(property.expr(), state_->values());
 }
 
-class StateLess {
- public:
-  bool operator()(const State& lhs, const State& rhs) const {
-    return lhs.values() < rhs.values();
-  }
-};
-
 void SamplingVerifier::DoVisitCompiledUntilProperty(
     const CompiledUntilProperty& path_property) {
   Optional<BDD> dd1;
   Optional<BDD> dd2;
   Optional<BDD> feasible;
   bool use_termination_probability = false;
-  if (dd_model_ == nullptr) {
+
+  unsigned int visit_no = ceil(base_vn_);
+  // Number of distinct candidates inspected so far
+  int cnd_seen = 0;
+  // Sequence of candidates on the path
+  std::deque<Candidate> cnd_list;
+  // Map from states to their candidates
+  std::map<State, unsigned int, StateLess> cnd_map;
+  // The birth of the last inspected candidate
+  int lst_cnd_idx;
+
+  switch(params_.engine){
+  case ModelCheckingEngine::SAMPLING: {
     // Sampling engine.
     use_termination_probability = path_property.is_unbounded();
-  } else  {
-    // Mixed engine.
+  }
+    break;
+
+  case ModelCheckingEngine::MIXED: {
     auto i = dd_cache_.find(path_property.index());
     if (i != dd_cache_.end()) {
       dd1 = i->second.dd1;
@@ -567,9 +671,22 @@ void SamplingVerifier::DoVisitCompiledUntilProperty(
         }
       }
       dd_cache_.insert({path_property.index(),
-                        {dd1.value(), dd2.value(), feasible}});
+	    {dd1.value(), dd2.value(), feasible}});
     }
   }
+    break;
+
+  case ModelCheckingEngine::ADAPTIVE: {
+    cnd_list.push_back(Candidate(1,*state_));
+    lst_cnd_idx = 1;
+  }
+    break;
+
+  default:
+    std::cerr << "Unsuported engine" << std::endl;
+    exit(1);
+  }
+
   double t = 0.0;
   State curr_state = *state_;
   State next_state = *state_;
@@ -588,6 +705,7 @@ void SamplingVerifier::DoVisitCompiledUntilProperty(
   auto* post_states_inserter_ptr =
       path_property.post_property().is_probabilistic() ? &post_states_inserter
                                                        : nullptr;
+
   while (!done && path_length < params_.max_path_length) {
     if (VLOG_IS_ON(3) && probabilistic_level_ == 1) {
       LOG(INFO) << "t = " << t << ": " << StateToString(curr_state);
@@ -631,6 +749,50 @@ void SamplingVerifier::DoVisitCompiledUntilProperty(
           output = true;
         }
       }
+
+      if (!done && params_.engine == ModelCheckingEngine::ADAPTIVE){
+	// Update candidates
+	Candidate& current_cnd = cnd_list.back();
+	if (current_cnd.contains(next_state)){
+	  current_cnd.count(next_state);
+	} else {
+	  auto it = cnd_map.find(next_state);
+	  
+	  if (it == cnd_map.end()){
+	    // Create new candidate
+	    cnd_list.push_back(Candidate(path_length, next_state));
+	    cnd_map[next_state] = cnd_list.size();
+	  } else {
+	    // State belongs to some older candidate -- merge all candidates from that point
+	    Candidate cnd(path_length, next_state);
+
+	    while (cnd_list.size() > it->second){
+	      Candidate& old_cnd = cnd_list.back();
+	      cnd.mergeWith(old_cnd); 
+	      cnd_list.pop_back();
+	    }
+	    cnd_list.push_back(cnd);
+
+	    for (auto it=cnd.counter().begin(); it!=cnd.counter().end(); ++it){
+	      cnd_map[it->first] = cnd_list.size() - 1;
+	    }
+	  }
+	}
+	// Check if the candidate is strong enough
+	if (path_length % check_cnd_ == 0){
+	  Candidate& curr_cnd = cnd_list.back();
+
+	  if (curr_cnd.isStrong(visit_no)){
+	    result_ = false;
+	    done = true;
+	  } else if ((lst_cnd_idx != curr_cnd.creationIndex()) && !curr_cnd.isTrivial()){
+	    cnd_seen++;
+	    visit_no = ceil(base_vn_ + cnd_seen * incr_vn_);
+	    lst_cnd_idx = curr_cnd.creationIndex();
+	  }
+	}
+      }
+      
       std::swap(state_, curr_state_ptr);
       if (!done) {
         curr_state.swap(next_state);

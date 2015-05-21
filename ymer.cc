@@ -72,6 +72,7 @@ static option long_options[] = {
     {"epsilon", required_argument, 0, 'E'},
     {"const", required_argument, 0, 'c'},
     {"engine", required_argument, 0, 'e'},
+    {"false-cnd-probability", required_argument, 0, 'f'},
     {"host", required_argument, 0, 'H'},
     {"max-path-length", required_argument, 0, 'L'},
     {"memoization", no_argument, 0, 'M'},
@@ -81,6 +82,7 @@ static option long_options[] = {
     {"port", required_argument, 0, 'P'},
     {"termination-probability", required_argument, 0, 'p'},
     {"estimation-algorithm", required_argument, 0, 'q'},
+    {"min-transition-probability", required_argument, 0, 'r'},
     {"report-statistics", no_argument, 0, 'R'},
     {"seed", required_argument, 0, 'S'},
     {"trials", required_argument, 0, 'T'},
@@ -88,7 +90,7 @@ static option long_options[] = {
     {"version", no_argument, 0, 'V'},
     {"help", no_argument, 0, 'h'},
     {0, 0, 0, 0}};
-static const char OPTION_STRING[] = "A:B:c:D:E:e:H:hL:Mm:N:n:p:P:q:S:T:t:V";
+static const char OPTION_STRING[] = "A:B:c:D:E:e:f:H:hL:Mm:N:n:p:P:q:r:R:S:T:t:V";
 
 namespace {
 
@@ -113,7 +115,9 @@ void display_help() {
       << "use precision e with hybrid engine (default is 1e-6)" << std::endl
       << "  -e e,  --engine=e\t"
       << "use engine e; can be `sampling' (default), `hybrid'," << std::endl
-      << "\t\t\t  or `mixed'" << std::endl
+      << "\t\t\t  'adaptive' or `mixed'" << std::endl
+      << "  -f p,  --false-cnd-probability=p\t" << std::endl
+      << "\t\t\tmaximum probability of identifing a false candidate in the 'adaptive' engine," << std::endl
       << "  -H h,  --host=h\t"
       << "connect to server on host h" << std::endl
       << "  -L l,  --max_path-length=l" << std::endl
@@ -131,6 +135,9 @@ void display_help() {
       << std::endl
       << "  -q q,  --estimation-algorithm=q" << std::endl
       << "\t\t\tuse sampling algorithm q for estimation" << std::endl
+      << "  -r p,  --min-transition-probability=p" << std::endl
+      << "\t\t\tlower bound on the minimum transition probability"
+      << std::endl
       << "  -R,    --report-statistics" << std::endl
       << "\t\t\treport additional statistics for sampling and mixed engines"
       << std::endl
@@ -1145,6 +1152,10 @@ std::vector<bool> CheckUnsupported(
               "mixed engine does not support nested unbounded properties");
         }
         break;
+      case ModelCheckingEngine::ADAPTIVE:
+      // TODO(przemek): add checks
+	break;
+
     }
   }
   return is_estimation;
@@ -1216,6 +1227,8 @@ int main(int argc, char* argv[]) {
   params.delta = 1e-2;
   params.epsilon = 1e-6;
   params.termination_probability = 1e-6;
+  params.min_transition_probability = 0;
+  params.false_cnd_probability = 1e-3;
   params.engine = ModelCheckingEngine::SAMPLING;
   params.threshold_algorithm = ThresholdAlgorithm::SPRT;
   params.estimation_algorithm = EstimationAlgorithm::CHOW_ROBBINS;
@@ -1299,11 +1312,21 @@ int main(int argc, char* argv[]) {
             params.engine = ModelCheckingEngine::HYBRID;
           } else if (strcasecmp(optarg, "mixed") == 0) {
             params.engine = ModelCheckingEngine::MIXED;
-          } else {
+	  } else if (strcasecmp(optarg, "adaptive") == 0) {
+            params.engine = ModelCheckingEngine::ADAPTIVE;
+          }
+	  else {
             throw std::invalid_argument("unsupported engine `" +
                                         std::string(optarg) + "'");
           }
           break;
+        case 'f':
+          params.false_cnd_probability = atof(optarg);
+	  if (params.false_cnd_probability < 1e-10)
+	    throw std::invalid_argument("false-cnd-probability < 1e-10");
+	  if (params.false_cnd_probability >= 1)
+	    throw std::invalid_argument("false-cnd-probability >= 1");
+	  break;
         case 'H':
           hostname = optarg;
           break;
@@ -1341,6 +1364,14 @@ int main(int argc, char* argv[]) {
         case 'q':
           params.estimation_algorithm = ParseEstimationAlgorithm(optarg);
           break;
+      case 'r':
+          params.min_transition_probability = atof(optarg);
+	  if (params.min_transition_probability <= 0)
+	    throw std::invalid_argument("min-transition-probability <=0");
+	  	  if (params.min_transition_probability > 1)
+	    throw std::invalid_argument("min-transition-probability >1");
+          break;
+
         case 'R':
           report_statistics = true;
           break;
@@ -1369,6 +1400,12 @@ int main(int argc, char* argv[]) {
     }
     if (params.nested_error > 0) {
       CHECK_LT(params.nested_error, MaxNestedError(params.delta));
+    }
+
+    if (params.engine == ModelCheckingEngine::ADAPTIVE){
+      if (params.min_transition_probability == 0){
+	throw std::invalid_argument("Option --min-transition-probability required for the 'adaptive' engine.");
+      }
     }
 
     /*
@@ -1598,7 +1635,7 @@ int main(int argc, char* argv[]) {
       }
     }
 
-    if (params.engine == ModelCheckingEngine::SAMPLING) {
+    if (params.engine == ModelCheckingEngine::SAMPLING || params.engine == ModelCheckingEngine::ADAPTIVE) {
       DCEngine dc_engine;
       dc_engine.seed(seed);
       std::cout << "Sampling engine: alpha=" << params.alpha

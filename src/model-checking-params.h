@@ -23,7 +23,7 @@
 #define MODEL_CHECKING_PARAMS_H_
 
 // Model checking eninges.
-enum class ModelCheckingEngine { SAMPLING, HYBRID, MIXED };
+enum class ModelCheckingEngine { SAMPLING, HYBRID, MIXED, ADAPTIVE };
 
 // Hypothesis testing algorithms.
 enum class ThresholdAlgorithm { FIXED, SSP, SPRT, CHOW_ROBBINS };
@@ -38,6 +38,8 @@ struct ModelCheckingParams {
   double delta;
   double epsilon;
   double termination_probability;
+  double min_transition_probability;
+  double false_cnd_probability;
   ModelCheckingEngine engine;
   ThresholdAlgorithm threshold_algorithm;
   EstimationAlgorithm estimation_algorithm;
